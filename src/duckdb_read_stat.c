@@ -171,6 +171,121 @@ static char *duckdb_read_stat_escape_sql_string(const char *input)
     return out;
 }
 
+typedef enum duckdb_read_stat_temporal_type
+{
+    DUCKDB_READ_STAT_TEMPORAL_NONE,
+    DUCKDB_READ_STAT_TEMPORAL_DATE,
+    DUCKDB_READ_STAT_TEMPORAL_DATETIME,
+    DUCKDB_READ_STAT_TEMPORAL_TIME
+} duckdb_read_stat_temporal_type;
+
+static duckdb_read_stat_temporal_type duckdb_read_stat_classify_format(const char *format)
+{
+    if (!format)
+    {
+        return DUCKDB_READ_STAT_TEMPORAL_NONE;
+    }
+
+    // Date formats
+    if (
+        // SAS
+        !strcmp(format, "WEEKDATE") || !strcmp(format, "MMDDYY") || !strcmp(format, "DDMMYY") || !strcmp(format, "YYMMDD") || !strcmp(format, "DATE") || !strcmp(format, "DATE9") || !strcmp(format, "YYMMDD10") || !strcmp(format, "DDMMYYB") || !strcmp(format, "DDMMYYB10") || !strcmp(format, "DDMMYYC") || !strcmp(format, "DDMMYYC10") || !strcmp(format, "DDMMYYD") || !strcmp(format, "DDMMYYD10") || !strcmp(format, "DDMMYYN6") || !strcmp(format, "DDMMYYN8") || !strcmp(format, "DDMMYYP") || !strcmp(format, "DDMMYYP10") || !strcmp(format, "DDMMYYS") || !strcmp(format, "DDMMYYS10") || !strcmp(format, "MMDDYYB") || !strcmp(format, "MMDDYYB10") || !strcmp(format, "MMDDYYC") || !strcmp(format, "MMDDYYC10") || !strcmp(format, "MMDDYYD") || !strcmp(format, "MMDDYYD10") || !strcmp(format, "MMDDYYN6") || !strcmp(format, "MMDDYYN8") || !strcmp(format, "MMDDYYP") || !strcmp(format, "MMDDYYP10") || !strcmp(format, "MMDDYYS") || !strcmp(format, "MMDDYYS10") || !strcmp(format, "WEEKDATX") || !strcmp(format, "DTDATE") || !strcmp(format, "IS8601DA") || !strcmp(format, "E8601DA") || !strcmp(format, "B8601DA") || !strcmp(format, "YYMMDDB") || !strcmp(format, "YYMMDDD") || !strcmp(format, "YYMMDDN") || !strcmp(format, "YYMMDDP") || !strcmp(format, "YYMMDDS")
+        // SPSS
+        || !strcmp(format, "DATE8") || !strcmp(format, "DATE11") || !strcmp(format, "DATE12") || !strcmp(format, "ADATE") || !strcmp(format, "ADATE8") || !strcmp(format, "ADATE10") || !strcmp(format, "EDATE") || !strcmp(format, "EDATE8") || !strcmp(format, "EDATE10") || !strcmp(format, "JDATE") || !strcmp(format, "JDATE5") || !strcmp(format, "JDATE7") || !strcmp(format, "SDATE") || !strcmp(format, "SDATE8") || !strcmp(format, "SDATE10")
+        // Stata
+        || !strcmp(format, "%td") || !strcmp(format, "%d") || !strcmp(format, "%tdD_m_Y") || !strcmp(format, "%tdCCYY-NN-DD"))
+    {
+        return DUCKDB_READ_STAT_TEMPORAL_DATE;
+    }
+
+    // Datetime formats
+    if (
+        // SAS
+        !strcmp(format, "DATETIME") || !strcmp(format, "DATETIME18") || !strcmp(format, "DATETIME19") || !strcmp(format, "DATETIME20") || !strcmp(format, "DATETIME21") || !strcmp(format, "DATETIME22") || !strcmp(format, "E8601DT") || !strcmp(format, "DATEAMPM") || !strcmp(format, "MDYAMPM") || !strcmp(format, "IS8601DT") || !strcmp(format, "B8601DT") || !strcmp(format, "B8601DN")
+        // SPSS
+        || !strcmp(format, "DATETIME8") || !strcmp(format, "DATETIME17") || !strcmp(format, "DATETIME23.2") || !strcmp(format, "YMDHMS16") || !strcmp(format, "YMDHMS19") || !strcmp(format, "YMDHMS19.2") || !strcmp(format, "YMDHMS20")
+        // Stata
+        || !strcmp(format, "%tC") || !strcmp(format, "%tc"))
+    {
+        return DUCKDB_READ_STAT_TEMPORAL_DATETIME;
+    }
+
+    // Time formats
+    if (
+        // SAS
+        !strcmp(format, "TIME") || !strcmp(format, "HHMM") || !strcmp(format, "TIME20.3") || !strcmp(format, "TIME20") || !strcmp(format, "TIME5") || !strcmp(format, "TOD") || !strcmp(format, "TIMEAMPM") || !strcmp(format, "IS8601TM") || !strcmp(format, "E8601TM") || !strcmp(format, "B8601TM")
+        // SPSS
+        || !strcmp(format, "DTIME") || !strcmp(format, "TIME8") || !strcmp(format, "TIME5") || !strcmp(format, "TIME11.2")
+        // Stata
+        || !strcmp(format, "%tcHH:MM:SS") || !strcmp(format, "%tcHH:MM"))
+    {
+        return DUCKDB_READ_STAT_TEMPORAL_TIME;
+    }
+
+    return DUCKDB_READ_STAT_TEMPORAL_NONE;
+}
+
+static readstat_error_t duckdb_read_stat_dispatch_parse(readstat_parser_t *parser, const char *path,
+                                                        const char *format,
+                                                        duckdb_read_stat_file_format *file_format, void *ctx)
+{
+    if (format != NULL)
+    {
+        if (!strcasecmp(format, "sas7bdat"))
+        {
+            if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+            return readstat_parse_sas7bdat(parser, path, ctx);
+        }
+        else if (!strcasecmp(format, "xpt"))
+        {
+            if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+            return readstat_parse_xport(parser, path, ctx);
+        }
+        else if (!strcasecmp(format, "sav") || !strcasecmp(format, "zsav"))
+        {
+            if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+            return readstat_parse_sav(parser, path, ctx);
+        }
+        else if (!strcasecmp(format, "por"))
+        {
+            if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+            return readstat_parse_por(parser, path, ctx);
+        }
+        else if (!strcasecmp(format, "dta"))
+        {
+            if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
+            return readstat_parse_dta(parser, path, ctx);
+        }
+    }
+    else if (duckdb_read_stat_ends_with(path, ".sas7bdat"))
+    {
+        if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+        return readstat_parse_sas7bdat(parser, path, ctx);
+    }
+    else if (duckdb_read_stat_ends_with(path, ".xpt"))
+    {
+        if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+        return readstat_parse_xport(parser, path, ctx);
+    }
+    else if (duckdb_read_stat_ends_with(path, ".sav") || duckdb_read_stat_ends_with(path, ".zsav"))
+    {
+        if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+        return readstat_parse_sav(parser, path, ctx);
+    }
+    else if (duckdb_read_stat_ends_with(path, ".por"))
+    {
+        if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+        return readstat_parse_por(parser, path, ctx);
+    }
+    else if (duckdb_read_stat_ends_with(path, ".dta"))
+    {
+        if (file_format) *file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
+        return readstat_parse_dta(parser, path, ctx);
+    }
+
+    return READSTAT_OK;
+}
+
 #ifdef DUCKDB_WASM_EXTENSION
 typedef struct duckdb_read_stat_webfs_ctx
 {
@@ -749,46 +864,20 @@ int duckdb_read_stat_bind_handle_variable(int index, readstat_variable_t *variab
         logical_type = duckdb_create_logical_type(DUCKDB_TYPE_FLOAT);
         break;
     case READSTAT_TYPE_DOUBLE:
-        if (format != NULL)
+        switch (duckdb_read_stat_classify_format(format))
         {
-            if (
-                // SAS
-                !strcmp(format, "WEEKDATE") || !strcmp(format, "MMDDYY") || !strcmp(format, "DDMMYY") || !strcmp(format, "YYMMDD") || !strcmp(format, "DATE") || !strcmp(format, "DATE9") || !strcmp(format, "YYMMDD10") || !strcmp(format, "DDMMYYB") || !strcmp(format, "DDMMYYB10") || !strcmp(format, "DDMMYYC") || !strcmp(format, "DDMMYYC10") || !strcmp(format, "DDMMYYD") || !strcmp(format, "DDMMYYD10") || !strcmp(format, "DDMMYYN6") || !strcmp(format, "DDMMYYN8") || !strcmp(format, "DDMMYYP") || !strcmp(format, "DDMMYYP10") || !strcmp(format, "DDMMYYS") || !strcmp(format, "DDMMYYS10") || !strcmp(format, "MMDDYYB") || !strcmp(format, "MMDDYYB10") || !strcmp(format, "MMDDYYC") || !strcmp(format, "MMDDYYC10") || !strcmp(format, "MMDDYYD") || !strcmp(format, "MMDDYYD10") || !strcmp(format, "MMDDYYN6") || !strcmp(format, "MMDDYYN8") || !strcmp(format, "MMDDYYP") || !strcmp(format, "MMDDYYP10") || !strcmp(format, "MMDDYYS") || !strcmp(format, "MMDDYYS10") || !strcmp(format, "WEEKDATX") || !strcmp(format, "DTDATE") || !strcmp(format, "IS8601DA") || !strcmp(format, "E8601DA") || !strcmp(format, "B8601DA") || !strcmp(format, "YYMMDDB") || !strcmp(format, "YYMMDDD") || !strcmp(format, "YYMMDDN") || !strcmp(format, "YYMMDDP") || !strcmp(format, "YYMMDDS")
-                // SPSS without duplicates from SAS
-                || !strcmp(format, "DATE8") || !strcmp(format, "DATE11") || !strcmp(format, "DATE12") || !strcmp(format, "ADATE") || !strcmp(format, "ADATE8") || !strcmp(format, "ADATE10") || !strcmp(format, "EDATE") || !strcmp(format, "EDATE8") || !strcmp(format, "EDATE10") || !strcmp(format, "JDATE") || !strcmp(format, "JDATE5") || !strcmp(format, "JDATE7") || !strcmp(format, "SDATE") || !strcmp(format, "SDATE8") || !strcmp(format, "SDATE10")
-                // Stata
-                || !strcmp(format, "%td") || !strcmp(format, "%d") || !strcmp(format, "%tdD_m_Y") || !strcmp(format, "%tdCCYY-NN-DD"))
-            {
-                logical_type = duckdb_create_logical_type(DUCKDB_TYPE_DATE);
-            }
-            else if (
-                // SAS
-                !strcmp(format, "DATETIME") || !strcmp(format, "DATETIME18") || !strcmp(format, "DATETIME19") || !strcmp(format, "DATETIME20") || !strcmp(format, "DATETIME21") || !strcmp(format, "DATETIME22") || !strcmp(format, "E8601DT") || !strcmp(format, "DATEAMPM") || !strcmp(format, "MDYAMPM") || !strcmp(format, "IS8601DT") || !strcmp(format, "B8601DT") || !strcmp(format, "B8601DN")
-                // SPSS without duplicates from SAS
-                || !strcmp(format, "DATETIME8") || !strcmp(format, "DATETIME17") || !strcmp(format, "DATETIME23.2") || !strcmp(format, "YMDHMS16") || !strcmp(format, "YMDHMS19") || !strcmp(format, "YMDHMS19.2") || !strcmp(format, "YMDHMS20")
-                // Stata
-                || !strcmp(format, "%tC") || !strcmp(format, "%tc"))
-            {
-                logical_type = duckdb_create_logical_type(DUCKDB_TYPE_TIMESTAMP);
-            }
-            else if (
-                // SAS
-                !strcmp(format, "TIME") || !strcmp(format, "HHMM") || !strcmp(format, "TIME20.3") || !strcmp(format, "TIME20") || !strcmp(format, "TIME5") || !strcmp(format, "TOD") || !strcmp(format, "TIMEAMPM") || !strcmp(format, "IS8601TM") || !strcmp(format, "E8601TM") || !strcmp(format, "B8601TM")
-                // SPSS without duplicates from SAS
-                || !strcmp(format, "DTIME") || !strcmp(format, "TIME8") || !strcmp(format, "TIME5") || !strcmp(format, "TIME11.2")
-                // Stata
-                || !strcmp(format, "%tcHH:MM:SS") || !strcmp(format, "%tcHH:MM"))
-            {
-                logical_type = duckdb_create_logical_type(DUCKDB_TYPE_TIME);
-            }
-            else
-            {
-                logical_type = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
-            }
-        }
-        else
-        {
+        case DUCKDB_READ_STAT_TEMPORAL_DATE:
+            logical_type = duckdb_create_logical_type(DUCKDB_TYPE_DATE);
+            break;
+        case DUCKDB_READ_STAT_TEMPORAL_DATETIME:
+            logical_type = duckdb_create_logical_type(DUCKDB_TYPE_TIMESTAMP);
+            break;
+        case DUCKDB_READ_STAT_TEMPORAL_TIME:
+            logical_type = duckdb_create_logical_type(DUCKDB_TYPE_TIME);
+            break;
+        default:
             logical_type = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
+            break;
         }
         break;
     }
@@ -812,63 +901,7 @@ void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx)
 
 static readstat_error_t duckdb_read_stat_parse_file(readstat_parser_t *parser, duckdb_read_stat_bind_data *data)
 {
-    readstat_error_t error = READSTAT_OK;
-
-    if (data->format != NULL)
-    {
-        if (!strcasecmp(data->format, "sas7bdat"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_sas7bdat(parser, data->path, data);
-        }
-        else if (!strcasecmp(data->format, "xpt"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_xport(parser, data->path, data);
-        }
-        else if (!strcasecmp(data->format, "sav") || !strcasecmp(data->format, "zsav"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_sav(parser, data->path, data);
-        }
-        else if (!strcasecmp(data->format, "por"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_por(parser, data->path, data);
-        }
-        else if (!strcasecmp(data->format, "dta"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-            error = readstat_parse_dta(parser, data->path, data);
-        }
-    }
-    else if (duckdb_read_stat_ends_with(data->path, ".sas7bdat"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_sas7bdat(parser, data->path, data);
-    }
-    else if (duckdb_read_stat_ends_with(data->path, ".xpt"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_xport(parser, data->path, data);
-    }
-    else if (duckdb_read_stat_ends_with(data->path, ".sav") || duckdb_read_stat_ends_with(data->path, ".zsav"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_sav(parser, data->path, data);
-    }
-    else if (duckdb_read_stat_ends_with(data->path, ".por"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_por(parser, data->path, data);
-    }
-    else if (duckdb_read_stat_ends_with(data->path, ".dta"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-        error = readstat_parse_dta(parser, data->path, data);
-    }
-
-    return error;
+    return duckdb_read_stat_dispatch_parse(parser, data->path, data->format, &data->file_format, data);
 }
 
 void duckdb_read_stat_bind(duckdb_bind_info info)
@@ -1219,54 +1252,29 @@ int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, 
         {
             double double_value = readstat_double_value(value);
 
-            if (format != NULL)
+            switch (duckdb_read_stat_classify_format(format))
             {
-                if (
-                    // SAS
-                    !strcmp(format, "WEEKDATE") || !strcmp(format, "MMDDYY") || !strcmp(format, "DDMMYY") || !strcmp(format, "YYMMDD") || !strcmp(format, "DATE") || !strcmp(format, "DATE9") || !strcmp(format, "YYMMDD10") || !strcmp(format, "DDMMYYB") || !strcmp(format, "DDMMYYB10") || !strcmp(format, "DDMMYYC") || !strcmp(format, "DDMMYYC10") || !strcmp(format, "DDMMYYD") || !strcmp(format, "DDMMYYD10") || !strcmp(format, "DDMMYYN6") || !strcmp(format, "DDMMYYN8") || !strcmp(format, "DDMMYYP") || !strcmp(format, "DDMMYYP10") || !strcmp(format, "DDMMYYS") || !strcmp(format, "DDMMYYS10") || !strcmp(format, "MMDDYYB") || !strcmp(format, "MMDDYYB10") || !strcmp(format, "MMDDYYC") || !strcmp(format, "MMDDYYC10") || !strcmp(format, "MMDDYYD") || !strcmp(format, "MMDDYYD10") || !strcmp(format, "MMDDYYN6") || !strcmp(format, "MMDDYYN8") || !strcmp(format, "MMDDYYP") || !strcmp(format, "MMDDYYP10") || !strcmp(format, "MMDDYYS") || !strcmp(format, "MMDDYYS10") || !strcmp(format, "WEEKDATX") || !strcmp(format, "DTDATE") || !strcmp(format, "IS8601DA") || !strcmp(format, "E8601DA") || !strcmp(format, "B8601DA") || !strcmp(format, "YYMMDDB") || !strcmp(format, "YYMMDDD") || !strcmp(format, "YYMMDDN") || !strcmp(format, "YYMMDDP") || !strcmp(format, "YYMMDDS")
-                    // SPSS without duplicates from SAS
-                    || !strcmp(format, "DATE8") || !strcmp(format, "DATE11") || !strcmp(format, "DATE12") || !strcmp(format, "ADATE") || !strcmp(format, "ADATE8") || !strcmp(format, "ADATE10") || !strcmp(format, "EDATE") || !strcmp(format, "EDATE8") || !strcmp(format, "EDATE10") || !strcmp(format, "JDATE") || !strcmp(format, "JDATE5") || !strcmp(format, "JDATE7") || !strcmp(format, "SDATE") || !strcmp(format, "SDATE8") || !strcmp(format, "SDATE10")
-                    // Stata
-                    || !strcmp(format, "%td") || !strcmp(format, "%d") || !strcmp(format, "%tdD_m_Y") || !strcmp(format, "%tdCCYY-NN-DD"))
-                {
-                    duckdb_date converted = duckdb_read_stat_to_date(double_value, bind_data->file_format);
-                    duckdb_date *output_value_timestamp = (duckdb_date *)duckdb_vector_get_data(vector);
-                    output_value_timestamp[obs_index] = converted;
-                }
-                else if (
-                    // SAS
-                    !strcmp(format, "DATETIME") || !strcmp(format, "DATETIME18") || !strcmp(format, "DATETIME19") || !strcmp(format, "DATETIME20") || !strcmp(format, "DATETIME21") || !strcmp(format, "DATETIME22") || !strcmp(format, "E8601DT") || !strcmp(format, "DATEAMPM") || !strcmp(format, "MDYAMPM") || !strcmp(format, "IS8601DT") || !strcmp(format, "B8601DT") || !strcmp(format, "B8601DN")
-                    // SPSS without duplicates from SAS
-                    || !strcmp(format, "DATETIME8") || !strcmp(format, "DATETIME17") || !strcmp(format, "DATETIME23.2") || !strcmp(format, "YMDHMS16") || !strcmp(format, "YMDHMS19") || !strcmp(format, "YMDHMS19.2") || !strcmp(format, "YMDHMS20")
-                    // Stata
-                    || !strcmp(format, "%tC") || !strcmp(format, "%tc"))
-                {
-                    duckdb_timestamp converted = duckdb_read_stat_to_timestamp(double_value, bind_data->file_format);
-                    duckdb_timestamp *output_value_timestamp = (duckdb_timestamp *)duckdb_vector_get_data(vector);
-                    output_value_timestamp[obs_index] = converted;
-                }
-                else if (
-                    // SAS
-                    !strcmp(format, "TIME") || !strcmp(format, "HHMM") || !strcmp(format, "TIME20.3") || !strcmp(format, "TIME20") || !strcmp(format, "TIME5") || !strcmp(format, "TOD") || !strcmp(format, "TIMEAMPM") || !strcmp(format, "IS8601TM") || !strcmp(format, "E8601TM") || !strcmp(format, "B8601TM")
-                    // SPSS without duplicates from SAS
-                    || !strcmp(format, "DTIME") || !strcmp(format, "TIME8") || !strcmp(format, "TIME5") || !strcmp(format, "TIME11.2")
-                    // Stata
-                    || !strcmp(format, "%tcHH:MM:SS") || !strcmp(format, "%tcHH:MM"))
-                {
-                    duckdb_time converted = duckdb_read_stat_to_time(double_value, bind_data->file_format);
-                    duckdb_time *output_value_timestamp = (duckdb_time *)duckdb_vector_get_data(vector);
-                    output_value_timestamp[obs_index] = converted;
-                }
-                else
-                {
-                    double *output_value = (double *)duckdb_vector_get_data(vector);
-                    output_value[obs_index] = double_value;
-                }
+            case DUCKDB_READ_STAT_TEMPORAL_DATE:
+            {
+                duckdb_date converted = duckdb_read_stat_to_date(double_value, bind_data->file_format);
+                ((duckdb_date *)duckdb_vector_get_data(vector))[obs_index] = converted;
+                break;
             }
-            else
+            case DUCKDB_READ_STAT_TEMPORAL_DATETIME:
             {
-                double *output_value = (double *)duckdb_vector_get_data(vector);
-                output_value[obs_index] = double_value;
+                duckdb_timestamp converted = duckdb_read_stat_to_timestamp(double_value, bind_data->file_format);
+                ((duckdb_timestamp *)duckdb_vector_get_data(vector))[obs_index] = converted;
+                break;
+            }
+            case DUCKDB_READ_STAT_TEMPORAL_TIME:
+            {
+                duckdb_time converted = duckdb_read_stat_to_time(double_value, bind_data->file_format);
+                ((duckdb_time *)duckdb_vector_get_data(vector))[obs_index] = converted;
+                break;
+            }
+            default:
+                ((double *)duckdb_vector_get_data(vector))[obs_index] = double_value;
+                break;
             }
             break;
         }
@@ -1303,18 +1311,12 @@ int duckdb_read_stat_handle_value_label(const char *val_labels, readstat_value_t
 void duckdb_read_stat_handle_error(const char *error_message, void *ctx)
 {
     duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
-    duckdb_read_stat_bind_data *bind_data =
-        (duckdb_read_stat_bind_data *)duckdb_function_get_bind_data(context->function_info);
-    char diag[512];
-    snprintf(diag, sizeof(diag),
-             "[exec diag: use_webfs=%d, protocol=%u, buffer_size=%llu, file_id=%u, file_size=%llu] %s",
-             bind_data ? bind_data->use_webfs : 0, bind_data ? bind_data->data_protocol : 0,
-             bind_data ? (unsigned long long)bind_data->buffer_size : 0ULL,
-             bind_data ? bind_data->file_id : 0U,
-             bind_data ? (unsigned long long)bind_data->file_size : 0ULL,
-             error_message ? error_message : "(no error message)");
-    context->error_message = (char *)duckdb_malloc(strlen(diag) + 1);
-    strcpy(context->error_message, diag);
+    if (context->error_message != NULL)
+    {
+        duckdb_free(context->error_message);
+    }
+    context->error_message = (char *)duckdb_malloc(strlen(error_message) + 1);
+    strcpy(context->error_message, error_message);
 }
 
 void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk output)
@@ -1364,49 +1366,7 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
     duckdb_read_stat_apply_buffer_io(parser, bind_data, &buffer_io_ctx);
 #endif
 
-    if (bind_data->format != NULL)
-    {
-        if (!strcasecmp(bind_data->format, "sas7bdat"))
-        {
-            error = readstat_parse_sas7bdat(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "xpt"))
-        {
-            error = readstat_parse_xport(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "sav") || !strcasecmp(bind_data->format, "zsav"))
-        {
-            error = readstat_parse_sav(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "por"))
-        {
-            error = readstat_parse_por(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "dta"))
-        {
-            error = readstat_parse_dta(parser, bind_data->path, context);
-        }
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".sas7bdat"))
-    {
-        error = readstat_parse_sas7bdat(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".xpt"))
-    {
-        error = readstat_parse_xport(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".sav") || duckdb_read_stat_ends_with(bind_data->path, ".zsav"))
-    {
-        error = readstat_parse_sav(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".por"))
-    {
-        error = readstat_parse_por(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".dta"))
-    {
-        error = readstat_parse_dta(parser, bind_data->path, context);
-    }
+    error = duckdb_read_stat_dispatch_parse(parser, bind_data->path, bind_data->format, NULL, context);
 
 #ifdef DUCKDB_WASM_EXTENSION
     if (error != READSTAT_OK && bind_data->use_webfs)
@@ -1445,51 +1405,7 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
             tmp_bind.buffer_size = fallback_size;
 
             duckdb_read_stat_apply_buffer_io(parser, &tmp_bind, &fallback_io_ctx);
-
-            // Re-run parse using the buffer path
-            if (bind_data->format != NULL)
-            {
-                if (!strcasecmp(bind_data->format, "sas7bdat"))
-                {
-                    error = readstat_parse_sas7bdat(parser, bind_data->path, context);
-                }
-                else if (!strcasecmp(bind_data->format, "xpt"))
-                {
-                    error = readstat_parse_xport(parser, bind_data->path, context);
-                }
-                else if (!strcasecmp(bind_data->format, "sav") || !strcasecmp(bind_data->format, "zsav"))
-                {
-                    error = readstat_parse_sav(parser, bind_data->path, context);
-                }
-                else if (!strcasecmp(bind_data->format, "por"))
-                {
-                    error = readstat_parse_por(parser, bind_data->path, context);
-                }
-                else if (!strcasecmp(bind_data->format, "dta"))
-                {
-                    error = readstat_parse_dta(parser, bind_data->path, context);
-                }
-            }
-            else if (duckdb_read_stat_ends_with(bind_data->path, ".sas7bdat"))
-            {
-                error = readstat_parse_sas7bdat(parser, bind_data->path, context);
-            }
-            else if (duckdb_read_stat_ends_with(bind_data->path, ".xpt"))
-            {
-                error = readstat_parse_xport(parser, bind_data->path, context);
-            }
-            else if (duckdb_read_stat_ends_with(bind_data->path, ".sav") || duckdb_read_stat_ends_with(bind_data->path, ".zsav"))
-            {
-                error = readstat_parse_sav(parser, bind_data->path, context);
-            }
-            else if (duckdb_read_stat_ends_with(bind_data->path, ".por"))
-            {
-                error = readstat_parse_por(parser, bind_data->path, context);
-            }
-            else if (duckdb_read_stat_ends_with(bind_data->path, ".dta"))
-            {
-                error = readstat_parse_dta(parser, bind_data->path, context);
-            }
+            error = duckdb_read_stat_dispatch_parse(parser, bind_data->path, bind_data->format, NULL, context);
         }
         else if (fallback_error)
         {

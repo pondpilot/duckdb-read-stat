@@ -12,13 +12,6 @@ typedef enum duckdb_read_stat_file_format
     DUCKDB_READ_STAT_FILE_FORMAT_STATA
 } duckdb_read_stat_file_format;
 
-typedef enum duckdb_read_stat_datetime_format
-{
-    DATE_FORMAT_DATE,
-    DATE_FORMAT_DATETIME,
-    DATE_FORMAT_TIME
-} duckdb_read_stat_datetime_format;
-
 typedef struct duckdb_read_stat_bind_data
 {
     duckdb_read_stat_file_format file_format;
