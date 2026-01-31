@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <ctype.h>
 #if defined(_MSC_VER)
 
 #define strncasecmp _strnicmp
@@ -18,6 +19,21 @@
 DUCKDB_EXTENSION_EXTERN
 
 static duckdb_connection g_read_stat_conn = NULL;
+
+#ifdef DUCKDB_WASM_EXTENSION
+typedef struct duckdb_web_response {
+    double statusCode;
+    double dataOrValue;
+    double dataSize;
+} duckdb_web_response;
+
+extern void duckdb_web_clear_response(void);
+extern void duckdb_web_fs_get_file_info_by_name(duckdb_web_response *packed, const char *file_name, size_t cache_epoch);
+extern void duckdb_web_copy_file_to_buffer(duckdb_web_response *packed, const char *path);
+extern void *duckdb_web_fs_file_open(size_t file_id, uint8_t flags);
+extern void duckdb_web_fs_file_close(size_t file_id);
+extern ssize_t duckdb_web_fs_file_read(size_t file_id, void *buffer, ssize_t bytes, double location);
+#endif
 
 typedef struct duckdb_read_stat_buffer_ctx {
     const uint8_t *data;
@@ -115,6 +131,20 @@ static readstat_error_t duckdb_read_stat_buffer_update(long file_size, readstat_
     return READSTAT_OK;
 }
 
+static void duckdb_read_stat_set_error_message(char **target, const char *message)
+{
+    if (!target || !message)
+    {
+        return;
+    }
+    if (*target)
+    {
+        duckdb_free(*target);
+    }
+    *target = (char *)duckdb_malloc(strlen(message) + 1);
+    strcpy(*target, message);
+}
+
 static char *duckdb_read_stat_escape_sql_string(const char *input)
 {
     size_t len = 0;
@@ -140,6 +170,396 @@ static char *duckdb_read_stat_escape_sql_string(const char *input)
     *dst = '\0';
     return out;
 }
+
+#ifdef DUCKDB_WASM_EXTENSION
+typedef struct duckdb_read_stat_webfs_ctx
+{
+    duckdb_read_stat_bind_data *bind_data;
+    uint32_t file_id;
+    uint64_t file_size;
+    uint64_t pos;
+    const uint8_t *buffer;
+    uint64_t buffer_size;
+    bool buffer_owned;
+    void *open_result;
+    bool opened;
+} duckdb_read_stat_webfs_ctx;
+
+static char *duckdb_read_stat_webfs_copy_response(const duckdb_web_response *resp)
+{
+    if (!resp || resp->dataOrValue == 0 || resp->dataSize == 0)
+    {
+        return NULL;
+    }
+    const char *src = (const char *)(uintptr_t)resp->dataOrValue;
+    size_t len = (size_t)resp->dataSize;
+    char *out = (char *)duckdb_malloc(len + 1);
+    memcpy(out, src, len);
+    out[len] = '\0';
+    return out;
+}
+
+static bool duckdb_read_stat_webfs_parse_number(const char *json, const char *key, double *out_value)
+{
+    if (!json || !key)
+    {
+        return false;
+    }
+    const char *pos = strstr(json, key);
+    if (!pos)
+    {
+        return false;
+    }
+    pos = strchr(pos, ':');
+    if (!pos)
+    {
+        return false;
+    }
+    pos++;
+    while (*pos && isspace((unsigned char)*pos))
+    {
+        pos++;
+    }
+    if (strncmp(pos, "null", 4) == 0)
+    {
+        return false;
+    }
+    char *endptr = NULL;
+    double value = strtod(pos, &endptr);
+    if (endptr == pos)
+    {
+        return false;
+    }
+    if (out_value)
+    {
+        *out_value = value;
+    }
+    return true;
+}
+
+static bool duckdb_read_stat_webfs_resolve_file(const char *path, uint32_t *out_file_id, uint64_t *out_size,
+                                                uint32_t *out_protocol, char **out_error)
+{
+    duckdb_web_response resp;
+    resp.statusCode = 0;
+    resp.dataOrValue = 0;
+    resp.dataSize = 0;
+
+    duckdb_web_fs_get_file_info_by_name(&resp, path, 0);
+    if ((uint64_t)resp.statusCode != 0)
+    {
+        if (out_error)
+        {
+            char *msg = duckdb_read_stat_webfs_copy_response(&resp);
+            if (msg)
+            {
+                *out_error = msg;
+            }
+            else
+            {
+                duckdb_read_stat_set_error_message(out_error, "Failed to resolve file info");
+            }
+        }
+        duckdb_web_clear_response();
+        return false;
+    }
+
+    char *json = duckdb_read_stat_webfs_copy_response(&resp);
+    duckdb_web_clear_response();
+    if (!json)
+    {
+        duckdb_read_stat_set_error_message(out_error, "File info lookup returned no data");
+        return false;
+    }
+
+    double file_id = 0.0;
+    double file_size = 0.0;
+    double data_protocol = 0.0;
+    bool has_file_id = duckdb_read_stat_webfs_parse_number(json, "\"fileId\"", &file_id);
+    bool has_file_size = duckdb_read_stat_webfs_parse_number(json, "\"fileSize\"", &file_size);
+    bool has_protocol = duckdb_read_stat_webfs_parse_number(json, "\"dataProtocol\"", &data_protocol);
+
+    duckdb_free(json);
+
+    if (!has_file_id)
+    {
+        duckdb_read_stat_set_error_message(
+            out_error,
+            "File is not registered in DuckDB WebFileSystem. Register a file handle or URL before reading.");
+        return false;
+    }
+
+    if (out_file_id)
+    {
+        *out_file_id = (uint32_t)file_id;
+    }
+    if (out_size && has_file_size)
+    {
+        *out_size = (uint64_t)file_size;
+    }
+    if (out_protocol && has_protocol)
+    {
+        *out_protocol = (uint32_t)data_protocol;
+    }
+
+    return true;
+}
+
+static bool duckdb_read_stat_webfs_copy_buffer(const char *path, uint8_t **out_data, idx_t *out_size,
+                                               char **out_error)
+{
+    duckdb_web_response resp;
+    resp.statusCode = 0;
+    resp.dataOrValue = 0;
+    resp.dataSize = 0;
+
+    duckdb_web_copy_file_to_buffer(&resp, path);
+    if ((uint64_t)resp.statusCode != 0)
+    {
+        if (out_error)
+        {
+            char *msg = duckdb_read_stat_webfs_copy_response(&resp);
+            if (msg)
+            {
+                *out_error = msg;
+            }
+            else
+            {
+                duckdb_read_stat_set_error_message(out_error, "Failed to copy file buffer");
+            }
+        }
+        duckdb_web_clear_response();
+        return false;
+    }
+
+    if (resp.dataOrValue == 0 || resp.dataSize == 0)
+    {
+        duckdb_web_clear_response();
+        duckdb_read_stat_set_error_message(out_error, "File buffer was empty");
+        return false;
+    }
+
+    const uint8_t *src = (const uint8_t *)(uintptr_t)resp.dataOrValue;
+    size_t len = (size_t)resp.dataSize;
+    uint8_t *buffer = (uint8_t *)duckdb_malloc(len);
+    memcpy(buffer, src, len);
+    duckdb_web_clear_response();
+
+    if (out_data)
+    {
+        *out_data = buffer;
+    }
+    if (out_size)
+    {
+        *out_size = (idx_t)len;
+    }
+    return true;
+}
+
+static int duckdb_read_stat_webfs_open(const char *path, void *io_ctx)
+{
+    (void)path;
+    duckdb_read_stat_webfs_ctx *ctx = (duckdb_read_stat_webfs_ctx *)io_ctx;
+    if (!ctx)
+    {
+        return -1;
+    }
+
+    if (ctx->opened)
+    {
+        duckdb_web_fs_file_close(ctx->file_id);
+        if (ctx->open_result)
+        {
+            free(ctx->open_result);
+        }
+        if (ctx->buffer && ctx->buffer_owned)
+        {
+            free((void *)ctx->buffer);
+        }
+        ctx->open_result = NULL;
+        ctx->buffer = NULL;
+        ctx->buffer_size = 0;
+        ctx->buffer_owned = false;
+        ctx->opened = false;
+    }
+
+    ctx->open_result = duckdb_web_fs_file_open(ctx->file_id, 1);
+    if (!ctx->open_result)
+    {
+        if (ctx->bind_data)
+        {
+            duckdb_read_stat_set_error_message(&ctx->bind_data->error_message, "Failed to open file in WebFileSystem");
+        }
+        return -1;
+    }
+
+    double *open_vals = (double *)ctx->open_result;
+    double file_size = open_vals[0];
+    double buffer_ptr = open_vals[1];
+
+    if (file_size > 0)
+    {
+        ctx->file_size = (uint64_t)file_size;
+    }
+    if (buffer_ptr != 0)
+    {
+        ctx->buffer = (const uint8_t *)(uintptr_t)buffer_ptr;
+        ctx->buffer_size = (uint64_t)file_size;
+        ctx->buffer_owned = true;
+    }
+
+    ctx->pos = 0;
+    ctx->opened = true;
+    return 0;
+}
+
+static int duckdb_read_stat_webfs_close(void *io_ctx)
+{
+    duckdb_read_stat_webfs_ctx *ctx = (duckdb_read_stat_webfs_ctx *)io_ctx;
+    if (!ctx)
+    {
+        return 0;
+    }
+    if (ctx->opened)
+    {
+        duckdb_web_fs_file_close(ctx->file_id);
+    }
+    if (ctx->open_result)
+    {
+        free(ctx->open_result);
+    }
+    if (ctx->buffer && ctx->buffer_owned)
+    {
+        free((void *)ctx->buffer);
+    }
+    ctx->open_result = NULL;
+    ctx->buffer = NULL;
+    ctx->buffer_size = 0;
+    ctx->buffer_owned = false;
+    ctx->opened = false;
+    ctx->pos = 0;
+    return 0;
+}
+
+static readstat_off_t duckdb_read_stat_webfs_seek(readstat_off_t offset, readstat_io_flags_t whence, void *io_ctx)
+{
+    duckdb_read_stat_webfs_ctx *ctx = (duckdb_read_stat_webfs_ctx *)io_ctx;
+    readstat_off_t newpos = -1;
+
+    if (whence == READSTAT_SEEK_SET)
+    {
+        newpos = offset;
+    }
+    else if (whence == READSTAT_SEEK_CUR)
+    {
+        newpos = (readstat_off_t)ctx->pos + offset;
+    }
+    else if (whence == READSTAT_SEEK_END)
+    {
+        newpos = (readstat_off_t)ctx->file_size + offset;
+    }
+
+    if (newpos < 0)
+    {
+        return -1;
+    }
+    if (ctx->file_size > 0 && (uint64_t)newpos > ctx->file_size)
+    {
+        return -1;
+    }
+
+    ctx->pos = (uint64_t)newpos;
+    return newpos;
+}
+
+static ssize_t duckdb_read_stat_webfs_read(void *buf, size_t nbytes, void *io_ctx)
+{
+    duckdb_read_stat_webfs_ctx *ctx = (duckdb_read_stat_webfs_ctx *)io_ctx;
+    if (!ctx)
+    {
+        return 0;
+    }
+
+    if (ctx->buffer)
+    {
+        ssize_t bytes_left = (ssize_t)ctx->buffer_size - (ssize_t)ctx->pos;
+        if (bytes_left <= 0)
+        {
+            return 0;
+        }
+        size_t to_copy = nbytes <= (size_t)bytes_left ? nbytes : (size_t)bytes_left;
+        memcpy(buf, ctx->buffer + ctx->pos, to_copy);
+        ctx->pos += (uint64_t)to_copy;
+        return (ssize_t)to_copy;
+    }
+
+    if (nbytes == 0)
+    {
+        return 0;
+    }
+
+    size_t total_read = 0;
+    uint8_t *out = (uint8_t *)buf;
+    while (total_read < nbytes)
+    {
+        ssize_t bytes_read = duckdb_web_fs_file_read(
+            ctx->file_id, out + total_read, (ssize_t)(nbytes - total_read), (double)(ctx->pos + total_read));
+        if (bytes_read <= 0)
+        {
+            if (total_read == 0)
+            {
+                return bytes_read;
+            }
+            break;
+        }
+        total_read += (size_t)bytes_read;
+    }
+    ctx->pos += (uint64_t)total_read;
+    return (ssize_t)total_read;
+}
+
+static readstat_error_t duckdb_read_stat_webfs_update(long file_size, readstat_progress_handler progress_handler,
+                                                      void *user_ctx, void *io_ctx)
+{
+    (void)file_size;
+    if (!progress_handler)
+    {
+        return READSTAT_OK;
+    }
+
+    duckdb_read_stat_webfs_ctx *ctx = (duckdb_read_stat_webfs_ctx *)io_ctx;
+    double denom = ctx->file_size == 0 ? 1.0 : (double)ctx->file_size;
+    double progress = ctx->file_size == 0 ? 1.0 : (double)ctx->pos / denom;
+
+    if (progress_handler(progress, user_ctx))
+    {
+        return READSTAT_ERROR_USER_ABORT;
+    }
+
+    return READSTAT_OK;
+}
+
+static void duckdb_read_stat_apply_webfs_io(readstat_parser_t *parser, duckdb_read_stat_bind_data *data,
+                                            duckdb_read_stat_webfs_ctx *io_ctx)
+{
+    io_ctx->bind_data = data;
+    io_ctx->file_id = data->file_id;
+    io_ctx->file_size = data->file_size;
+    io_ctx->pos = 0;
+    io_ctx->buffer = NULL;
+    io_ctx->buffer_size = 0;
+    io_ctx->buffer_owned = false;
+    io_ctx->open_result = NULL;
+    io_ctx->opened = false;
+
+    readstat_set_open_handler(parser, &duckdb_read_stat_webfs_open);
+    readstat_set_close_handler(parser, &duckdb_read_stat_webfs_close);
+    readstat_set_seek_handler(parser, &duckdb_read_stat_webfs_seek);
+    readstat_set_read_handler(parser, &duckdb_read_stat_webfs_read);
+    readstat_set_update_handler(parser, &duckdb_read_stat_webfs_update);
+    readstat_set_io_ctx(parser, io_ctx);
+}
+#endif
 
 static bool duckdb_read_stat_load_buffer(const char *path, uint8_t **out_data, idx_t *out_size, char **out_error)
 {
@@ -390,6 +810,67 @@ void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx)
     strcpy(context->error_message, error_message);
 }
 
+static readstat_error_t duckdb_read_stat_parse_file(readstat_parser_t *parser, duckdb_read_stat_bind_data *data)
+{
+    readstat_error_t error = READSTAT_OK;
+
+    if (data->format != NULL)
+    {
+        if (!strcasecmp(data->format, "sas7bdat"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+            error = readstat_parse_sas7bdat(parser, data->path, data);
+        }
+        else if (!strcasecmp(data->format, "xpt"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+            error = readstat_parse_xport(parser, data->path, data);
+        }
+        else if (!strcasecmp(data->format, "sav") || !strcasecmp(data->format, "zsav"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+            error = readstat_parse_sav(parser, data->path, data);
+        }
+        else if (!strcasecmp(data->format, "por"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+            error = readstat_parse_por(parser, data->path, data);
+        }
+        else if (!strcasecmp(data->format, "dta"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
+            error = readstat_parse_dta(parser, data->path, data);
+        }
+    }
+    else if (duckdb_read_stat_ends_with(data->path, ".sas7bdat"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+        error = readstat_parse_sas7bdat(parser, data->path, data);
+    }
+    else if (duckdb_read_stat_ends_with(data->path, ".xpt"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+        error = readstat_parse_xport(parser, data->path, data);
+    }
+    else if (duckdb_read_stat_ends_with(data->path, ".sav") || duckdb_read_stat_ends_with(data->path, ".zsav"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+        error = readstat_parse_sav(parser, data->path, data);
+    }
+    else if (duckdb_read_stat_ends_with(data->path, ".por"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+        error = readstat_parse_por(parser, data->path, data);
+    }
+    else if (duckdb_read_stat_ends_with(data->path, ".dta"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
+        error = readstat_parse_dta(parser, data->path, data);
+    }
+
+    return error;
+}
+
 void duckdb_read_stat_bind(duckdb_bind_info info)
 {
     readstat_parser_t *parser = readstat_parser_init();
@@ -406,6 +887,10 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
     data->encoding = NULL;
     data->buffer = NULL;
     data->buffer_size = 0;
+    data->data_protocol = 0;
+    data->file_id = 0;
+    data->file_size = 0;
+    data->use_webfs = false;
     data->error_message = NULL;
     data->cardinality = 0;
 
@@ -421,6 +906,60 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
         readstat_set_file_character_encoding(parser, encoding);
     }
 
+#ifdef DUCKDB_WASM_EXTENSION
+    // Declare io contexts at function scope so they outlive the if/else block
+    duckdb_read_stat_buffer_ctx buffer_io_ctx;
+    duckdb_read_stat_webfs_ctx webfs_io_ctx;
+    bool io_configured = false;
+
+    // Resolve file info via WebFS first to pick the right IO path
+    if (duckdb_read_stat_webfs_resolve_file(
+            data->path, &data->file_id, &data->file_size, &data->data_protocol, &data->error_message))
+    {
+        data->use_webfs = true;
+
+        // Prefer buffered reads for BUFFER + BROWSER_FILEREADER protocols
+        if (data->data_protocol == 0 || data->data_protocol == 2)
+        {
+            data->use_webfs = false;
+            if (duckdb_read_stat_webfs_copy_buffer(
+                    data->path, &data->buffer, &data->buffer_size, &data->error_message))
+            {
+                duckdb_read_stat_apply_buffer_io(parser, data, &buffer_io_ctx);
+                io_configured = true;
+            }
+        }
+        else
+        {
+            duckdb_read_stat_apply_webfs_io(parser, data, &webfs_io_ctx);
+            io_configured = true;
+        }
+    }
+
+    if (!io_configured)
+    {
+        // Clear any prior error before attempting read_blob
+        if (data->error_message != NULL)
+        {
+            duckdb_free(data->error_message);
+            data->error_message = NULL;
+        }
+
+        if (!duckdb_read_stat_load_buffer(data->path, &data->buffer, &data->buffer_size, &data->error_message))
+        {
+            if (data->error_message != NULL)
+            {
+                duckdb_bind_set_error(info, data->error_message);
+            }
+            readstat_parser_free(parser);
+            duckdb_read_stat_bind_data_free(data);
+            return;
+        }
+
+        data->use_webfs = false;
+        duckdb_read_stat_apply_buffer_io(parser, data, &buffer_io_ctx);
+    }
+#else
     if (!duckdb_read_stat_load_buffer(data->path, &data->buffer, &data->buffer_size, &data->error_message))
     {
         if (data->error_message != NULL)
@@ -434,67 +973,69 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
     duckdb_read_stat_buffer_ctx io_ctx;
     duckdb_read_stat_apply_buffer_io(parser, data, &io_ctx);
+#endif
 
     if (format_value != NULL)
     {
         char *format = duckdb_get_varchar(format_value);
         data->format = format;
+    }
 
-        if (!strcmp(format, "sas7bdat"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_sas7bdat(parser, path, data);
-        }
-        if (!strcmp(format, "xpt"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_xport(parser, path, data);
-        }
-        else if (!strcmp(format, "sav") || !strcmp(format, "zsav"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_sav(parser, path, data);
-        }
-        else if (!strcmp(format, "por"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_por(parser, path, data);
-        }
-        else if (!strcmp(format, "dta"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-            error = readstat_parse_dta(parser, path, data);
-        }
-    }
-    else if (duckdb_read_stat_ends_with(path, ".sas7bdat"))
+    error = duckdb_read_stat_parse_file(parser, data);
+
+#ifdef DUCKDB_WASM_EXTENSION
+    if (error != READSTAT_OK && data->use_webfs)
     {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_sas7bdat(parser, path, data);
+        uint8_t *fallback_buffer = NULL;
+        idx_t fallback_size = 0;
+        char *fallback_error = NULL;
+
+        if (data->error_message)
+        {
+            duckdb_free(data->error_message);
+            data->error_message = NULL;
+        }
+
+        if (duckdb_read_stat_webfs_copy_buffer(
+                data->path, &fallback_buffer, &fallback_size, &fallback_error))
+        {
+            readstat_parser_free(parser);
+            parser = readstat_parser_init();
+
+            readstat_set_metadata_handler(parser, &duckdb_read_stat_bind_handle_metadata);
+            readstat_set_variable_handler(parser, &duckdb_read_stat_bind_handle_variable);
+            readstat_set_error_handler(parser, &duckdb_read_stat_bind_handle_error);
+            readstat_set_row_limit(parser, 0);
+
+            if (data->encoding != NULL)
+            {
+                readstat_set_file_character_encoding(parser, data->encoding);
+            }
+
+            data->buffer = fallback_buffer;
+            data->buffer_size = fallback_size;
+            data->use_webfs = false;
+
+            duckdb_read_stat_buffer_ctx fallback_io_ctx;
+            duckdb_read_stat_apply_buffer_io(parser, data, &fallback_io_ctx);
+            error = duckdb_read_stat_parse_file(parser, data);
+        }
+        else if (fallback_error)
+        {
+            data->error_message = fallback_error;
+            fallback_error = NULL;
+        }
+
+        if (fallback_error)
+        {
+            duckdb_free(fallback_error);
+        }
     }
-    else if (duckdb_read_stat_ends_with(path, ".xpt"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_xport(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".sav") || duckdb_read_stat_ends_with(path, ".zsav"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_sav(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".por"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_por(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".dta"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-        error = readstat_parse_dta(parser, path, data);
-    }
+#endif
 
     if (error != READSTAT_OK)
     {
-        duckdb_bind_set_error(info, data->error_message);
+        duckdb_bind_set_error(info, data->error_message ? data->error_message : readstat_error_message(error));
         readstat_parser_free(parser);
         duckdb_read_stat_bind_data_free(data);
         return;
@@ -762,8 +1303,18 @@ int duckdb_read_stat_handle_value_label(const char *val_labels, readstat_value_t
 void duckdb_read_stat_handle_error(const char *error_message, void *ctx)
 {
     duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
-    context->error_message = (char *)duckdb_malloc(strlen(error_message) + 1);
-    strcpy(context->error_message, error_message);
+    duckdb_read_stat_bind_data *bind_data =
+        (duckdb_read_stat_bind_data *)duckdb_function_get_bind_data(context->function_info);
+    char diag[512];
+    snprintf(diag, sizeof(diag),
+             "[exec diag: use_webfs=%d, protocol=%u, buffer_size=%llu, file_id=%u, file_size=%llu] %s",
+             bind_data ? bind_data->use_webfs : 0, bind_data ? bind_data->data_protocol : 0,
+             bind_data ? (unsigned long long)bind_data->buffer_size : 0ULL,
+             bind_data ? bind_data->file_id : 0U,
+             bind_data ? (unsigned long long)bind_data->file_size : 0ULL,
+             error_message ? error_message : "(no error message)");
+    context->error_message = (char *)duckdb_malloc(strlen(diag) + 1);
+    strcpy(context->error_message, diag);
 }
 
 void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk output)
@@ -797,8 +1348,21 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
         readstat_set_file_character_encoding(parser, bind_data->encoding);
     }
 
-    duckdb_read_stat_buffer_ctx io_ctx;
-    duckdb_read_stat_apply_buffer_io(parser, bind_data, &io_ctx);
+#ifdef DUCKDB_WASM_EXTENSION
+    duckdb_read_stat_webfs_ctx webfs_io_ctx;
+    duckdb_read_stat_buffer_ctx buffer_io_ctx;
+    if (bind_data->use_webfs)
+    {
+        duckdb_read_stat_apply_webfs_io(parser, bind_data, &webfs_io_ctx);
+    }
+    else
+    {
+        duckdb_read_stat_apply_buffer_io(parser, bind_data, &buffer_io_ctx);
+    }
+#else
+    duckdb_read_stat_buffer_ctx buffer_io_ctx;
+    duckdb_read_stat_apply_buffer_io(parser, bind_data, &buffer_io_ctx);
+#endif
 
     if (bind_data->format != NULL)
     {
@@ -843,6 +1407,110 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
     {
         error = readstat_parse_dta(parser, bind_data->path, context);
     }
+
+#ifdef DUCKDB_WASM_EXTENSION
+    if (error != READSTAT_OK && bind_data->use_webfs)
+    {
+        uint8_t *fallback_buffer = NULL;
+        idx_t fallback_size = 0;
+        char *fallback_error = NULL;
+
+        if (context->error_message)
+        {
+            duckdb_free(context->error_message);
+            context->error_message = NULL;
+        }
+
+        if (duckdb_read_stat_webfs_copy_buffer(
+                bind_data->path, &fallback_buffer, &fallback_size, &fallback_error))
+        {
+            readstat_parser_free(parser);
+            parser = readstat_parser_init();
+
+            readstat_set_row_offset(parser, (long)init_data->offset);
+            readstat_set_row_limit(parser, (long)duckdb_vector_size());
+            readstat_set_metadata_handler(parser, &duckdb_read_stat_handle_metadata);
+            readstat_set_variable_handler(parser, &duckdb_read_stat_handle_variable);
+            readstat_set_value_handler(parser, &duckdb_read_stat_handle_value);
+            readstat_set_error_handler(parser, &duckdb_read_stat_handle_error);
+
+            if (bind_data->encoding != NULL)
+            {
+                readstat_set_file_character_encoding(parser, bind_data->encoding);
+            }
+
+            duckdb_read_stat_buffer_ctx fallback_io_ctx;
+            duckdb_read_stat_bind_data tmp_bind = *bind_data;
+            tmp_bind.buffer = fallback_buffer;
+            tmp_bind.buffer_size = fallback_size;
+
+            duckdb_read_stat_apply_buffer_io(parser, &tmp_bind, &fallback_io_ctx);
+
+            // Re-run parse using the buffer path
+            if (bind_data->format != NULL)
+            {
+                if (!strcasecmp(bind_data->format, "sas7bdat"))
+                {
+                    error = readstat_parse_sas7bdat(parser, bind_data->path, context);
+                }
+                else if (!strcasecmp(bind_data->format, "xpt"))
+                {
+                    error = readstat_parse_xport(parser, bind_data->path, context);
+                }
+                else if (!strcasecmp(bind_data->format, "sav") || !strcasecmp(bind_data->format, "zsav"))
+                {
+                    error = readstat_parse_sav(parser, bind_data->path, context);
+                }
+                else if (!strcasecmp(bind_data->format, "por"))
+                {
+                    error = readstat_parse_por(parser, bind_data->path, context);
+                }
+                else if (!strcasecmp(bind_data->format, "dta"))
+                {
+                    error = readstat_parse_dta(parser, bind_data->path, context);
+                }
+            }
+            else if (duckdb_read_stat_ends_with(bind_data->path, ".sas7bdat"))
+            {
+                error = readstat_parse_sas7bdat(parser, bind_data->path, context);
+            }
+            else if (duckdb_read_stat_ends_with(bind_data->path, ".xpt"))
+            {
+                error = readstat_parse_xport(parser, bind_data->path, context);
+            }
+            else if (duckdb_read_stat_ends_with(bind_data->path, ".sav") || duckdb_read_stat_ends_with(bind_data->path, ".zsav"))
+            {
+                error = readstat_parse_sav(parser, bind_data->path, context);
+            }
+            else if (duckdb_read_stat_ends_with(bind_data->path, ".por"))
+            {
+                error = readstat_parse_por(parser, bind_data->path, context);
+            }
+            else if (duckdb_read_stat_ends_with(bind_data->path, ".dta"))
+            {
+                error = readstat_parse_dta(parser, bind_data->path, context);
+            }
+        }
+        else if (fallback_error)
+        {
+            if (context->error_message)
+            {
+                duckdb_free(context->error_message);
+            }
+            context->error_message = fallback_error;
+            fallback_error = NULL;
+        }
+
+        if (fallback_buffer)
+        {
+            duckdb_free(fallback_buffer);
+        }
+        if (fallback_error)
+        {
+            duckdb_free(fallback_error);
+        }
+    }
+#endif
 
     if (error != READSTAT_OK)
     {

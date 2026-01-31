@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "readstat.h"
@@ -27,6 +28,10 @@ typedef struct duckdb_read_stat_bind_data
     const char *path;
     uint8_t *buffer;
     idx_t buffer_size;
+    uint32_t data_protocol;
+    uint32_t file_id;
+    uint64_t file_size;
+    bool use_webfs;
     char *error_message;
     duckdb_bind_info bind_info;
 } duckdb_read_stat_bind_data;
