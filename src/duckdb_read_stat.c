@@ -17,7 +17,7 @@
 
 DUCKDB_EXTENSION_EXTERN
 
-static duckdb_database *g_read_stat_db = NULL;
+static duckdb_connection g_read_stat_conn = NULL;
 
 typedef struct duckdb_read_stat_buffer_ctx {
     const uint8_t *data;
@@ -143,30 +143,18 @@ static char *duckdb_read_stat_escape_sql_string(const char *input)
 
 static bool duckdb_read_stat_load_buffer(const char *path, uint8_t **out_data, idx_t *out_size, char **out_error)
 {
-    if (!g_read_stat_db || !path)
+    if (!g_read_stat_conn || !path)
     {
-        return false;
-    }
-
-    duckdb_connection conn;
-    if (duckdb_connect(*g_read_stat_db, &conn) == DuckDBError)
-    {
-        if (out_error)
-        {
-            const char *msg = "Failed to open DuckDB connection for read_blob";
-            *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
-            strcpy(*out_error, msg);
-        }
         return false;
     }
 
     char *escaped = duckdb_read_stat_escape_sql_string(path);
-    size_t query_len = strlen("SELECT read_blob('')") + strlen(escaped) + 1;
+    size_t query_len = strlen("SELECT * FROM read_blob('')") + strlen(escaped) + 1;
     char *query = (char *)duckdb_malloc(query_len);
-    snprintf(query, query_len, "SELECT read_blob('%s')", escaped);
+    snprintf(query, query_len, "SELECT * FROM read_blob('%s')", escaped);
 
     duckdb_result result;
-    duckdb_state state = duckdb_query(conn, query, &result);
+    duckdb_state state = duckdb_query(g_read_stat_conn, query, &result);
 
     duckdb_free(query);
     duckdb_free(escaped);
@@ -183,11 +171,29 @@ static bool duckdb_read_stat_load_buffer(const char *path, uint8_t **out_data, i
             }
         }
         duckdb_destroy_result(&result);
-        duckdb_disconnect(&conn);
         return false;
     }
 
-    if (duckdb_value_is_null(&result, 0, 0))
+    duckdb_data_chunk chunk = duckdb_fetch_chunk(result);
+    if (!chunk || duckdb_data_chunk_get_size(chunk) == 0)
+    {
+        if (out_error)
+        {
+            const char *msg = "read_blob returned no data";
+            *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
+            strcpy(*out_error, msg);
+        }
+        if (chunk)
+        {
+            duckdb_destroy_data_chunk(&chunk);
+        }
+        duckdb_destroy_result(&result);
+        return false;
+    }
+
+    duckdb_vector vector = duckdb_data_chunk_get_vector(chunk, 0);
+    uint64_t *validity = duckdb_vector_get_validity(vector);
+    if (validity && !duckdb_validity_row_is_valid(validity, 0))
     {
         if (out_error)
         {
@@ -195,13 +201,16 @@ static bool duckdb_read_stat_load_buffer(const char *path, uint8_t **out_data, i
             *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
             strcpy(*out_error, msg);
         }
+        duckdb_destroy_data_chunk(&chunk);
         duckdb_destroy_result(&result);
-        duckdb_disconnect(&conn);
         return false;
     }
 
-    duckdb_blob blob = duckdb_value_blob(&result, 0, 0);
-    if (blob.size == 0 || blob.data == NULL)
+    duckdb_string_t *data = (duckdb_string_t *)duckdb_vector_get_data(vector);
+    duckdb_string_t blob_str = data[0];
+    idx_t blob_size = duckdb_string_t_length(blob_str);
+    const char *blob_ptr = duckdb_string_t_data(&blob_str);
+    if (blob_size == 0 || blob_ptr == NULL)
     {
         if (out_error)
         {
@@ -209,19 +218,19 @@ static bool duckdb_read_stat_load_buffer(const char *path, uint8_t **out_data, i
             *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
             strcpy(*out_error, msg);
         }
+        duckdb_destroy_data_chunk(&chunk);
         duckdb_destroy_result(&result);
-        duckdb_disconnect(&conn);
         return false;
     }
 
-    uint8_t *buffer = (uint8_t *)duckdb_malloc(blob.size);
-    memcpy(buffer, blob.data, blob.size);
+    uint8_t *buffer = (uint8_t *)duckdb_malloc(blob_size);
+    memcpy(buffer, blob_ptr, blob_size);
 
+    duckdb_destroy_data_chunk(&chunk);
     duckdb_destroy_result(&result);
-    duckdb_disconnect(&conn);
 
     *out_data = buffer;
-    *out_size = blob.size;
+    *out_size = blob_size;
     return true;
 }
 
@@ -884,10 +893,15 @@ void duckdb_read_stat_replacement_scan(duckdb_replacement_scan_info info, const 
     }
 }
 
-DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info info, struct duckdb_extension_access *access)
+DUCKDB_EXTENSION_ENTRYPOINT_CUSTOM(duckdb_extension_info info, struct duckdb_extension_access *access)
 {
-    g_read_stat_db = access->get_database(info);
-    duckdb_read_stat_register_read_stat_function(connection);
-    duckdb_add_replacement_scan(*(access->get_database(info)), &duckdb_read_stat_replacement_scan, NULL, NULL);
+    duckdb_database *db = access->get_database(info);
+    if (duckdb_connect(*db, &g_read_stat_conn) == DuckDBError)
+    {
+        access->set_error(info, "Failed to open connection for read_stat");
+        return false;
+    }
+    duckdb_read_stat_register_read_stat_function(g_read_stat_conn);
+    duckdb_add_replacement_scan(*db, &duckdb_read_stat_replacement_scan, NULL, NULL);
     return true;
 }
