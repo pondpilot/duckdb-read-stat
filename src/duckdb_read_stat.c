@@ -1,4 +1,7 @@
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
 #if defined(_MSC_VER)
 
 #define strncasecmp _strnicmp
@@ -13,6 +16,264 @@
 #include "duckdb_read_stat.h"
 
 DUCKDB_EXTENSION_EXTERN
+
+static duckdb_database *g_read_stat_db = NULL;
+
+typedef struct duckdb_read_stat_buffer_ctx {
+    const uint8_t *data;
+    idx_t size;
+    idx_t pos;
+} duckdb_read_stat_buffer_ctx;
+
+static int duckdb_read_stat_buffer_open(const char *path, void *io_ctx)
+{
+    (void)path;
+    (void)io_ctx;
+    return 0;
+}
+
+static int duckdb_read_stat_buffer_close(void *io_ctx)
+{
+    (void)io_ctx;
+    return 0;
+}
+
+static readstat_off_t duckdb_read_stat_buffer_seek(readstat_off_t offset, readstat_io_flags_t whence, void *io_ctx)
+{
+    duckdb_read_stat_buffer_ctx *ctx = (duckdb_read_stat_buffer_ctx *)io_ctx;
+    readstat_off_t newpos = -1;
+
+    if (whence == READSTAT_SEEK_SET)
+    {
+        newpos = offset;
+    }
+    else if (whence == READSTAT_SEEK_CUR)
+    {
+        newpos = (readstat_off_t)ctx->pos + offset;
+    }
+    else if (whence == READSTAT_SEEK_END)
+    {
+        newpos = (readstat_off_t)ctx->size + offset;
+    }
+
+    if (newpos < 0)
+    {
+        return -1;
+    }
+    if ((idx_t)newpos > ctx->size)
+    {
+        return -1;
+    }
+
+    ctx->pos = (idx_t)newpos;
+    return newpos;
+}
+
+static ssize_t duckdb_read_stat_buffer_read(void *buf, size_t nbytes, void *io_ctx)
+{
+    duckdb_read_stat_buffer_ctx *ctx = (duckdb_read_stat_buffer_ctx *)io_ctx;
+    ssize_t bytes_left = (ssize_t)ctx->size - (ssize_t)ctx->pos;
+    ssize_t bytes_copied = 0;
+
+    if (bytes_left <= 0)
+    {
+        return 0;
+    }
+
+    if ((ssize_t)nbytes <= bytes_left)
+    {
+        memcpy(buf, ctx->data + ctx->pos, nbytes);
+        bytes_copied = (ssize_t)nbytes;
+    }
+    else
+    {
+        memcpy(buf, ctx->data + ctx->pos, (size_t)bytes_left);
+        bytes_copied = bytes_left;
+    }
+
+    ctx->pos += (idx_t)bytes_copied;
+    return bytes_copied;
+}
+
+static readstat_error_t duckdb_read_stat_buffer_update(long file_size, readstat_progress_handler progress_handler,
+                                                       void *user_ctx, void *io_ctx)
+{
+    (void)file_size;
+    if (!progress_handler)
+    {
+        return READSTAT_OK;
+    }
+
+    duckdb_read_stat_buffer_ctx *ctx = (duckdb_read_stat_buffer_ctx *)io_ctx;
+    double progress = ctx->size == 0 ? 1.0 : (double)ctx->pos / (double)ctx->size;
+
+    if (progress_handler(progress, user_ctx))
+    {
+        return READSTAT_ERROR_USER_ABORT;
+    }
+
+    return READSTAT_OK;
+}
+
+static char *duckdb_read_stat_escape_sql_string(const char *input)
+{
+    size_t len = 0;
+    for (const char *p = input; *p; p++)
+    {
+        len += (*p == '\'') ? 2 : 1;
+    }
+
+    char *out = (char *)duckdb_malloc(len + 1);
+    char *dst = out;
+    for (const char *p = input; *p; p++)
+    {
+        if (*p == '\'')
+        {
+            *dst++ = '\'';
+            *dst++ = '\'';
+        }
+        else
+        {
+            *dst++ = *p;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
+static bool duckdb_read_stat_load_buffer(const char *path, uint8_t **out_data, idx_t *out_size, char **out_error)
+{
+    if (!g_read_stat_db || !path)
+    {
+        return false;
+    }
+
+    duckdb_connection conn;
+    if (duckdb_connect(*g_read_stat_db, &conn) == DuckDBError)
+    {
+        if (out_error)
+        {
+            const char *msg = "Failed to open DuckDB connection for read_blob";
+            *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
+            strcpy(*out_error, msg);
+        }
+        return false;
+    }
+
+    char *escaped = duckdb_read_stat_escape_sql_string(path);
+    size_t query_len = strlen("SELECT read_blob('')") + strlen(escaped) + 1;
+    char *query = (char *)duckdb_malloc(query_len);
+    snprintf(query, query_len, "SELECT read_blob('%s')", escaped);
+
+    duckdb_result result;
+    duckdb_state state = duckdb_query(conn, query, &result);
+
+    duckdb_free(query);
+    duckdb_free(escaped);
+
+    if (state == DuckDBError)
+    {
+        if (out_error)
+        {
+            const char *msg = duckdb_result_error(&result);
+            if (msg)
+            {
+                *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
+                strcpy(*out_error, msg);
+            }
+        }
+        duckdb_destroy_result(&result);
+        duckdb_disconnect(&conn);
+        return false;
+    }
+
+    if (duckdb_value_is_null(&result, 0, 0))
+    {
+        if (out_error)
+        {
+            const char *msg = "read_blob returned NULL";
+            *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
+            strcpy(*out_error, msg);
+        }
+        duckdb_destroy_result(&result);
+        duckdb_disconnect(&conn);
+        return false;
+    }
+
+    duckdb_blob blob = duckdb_value_blob(&result, 0, 0);
+    if (blob.size == 0 || blob.data == NULL)
+    {
+        if (out_error)
+        {
+            const char *msg = "read_blob returned empty data";
+            *out_error = (char *)duckdb_malloc(strlen(msg) + 1);
+            strcpy(*out_error, msg);
+        }
+        duckdb_destroy_result(&result);
+        duckdb_disconnect(&conn);
+        return false;
+    }
+
+    uint8_t *buffer = (uint8_t *)duckdb_malloc(blob.size);
+    memcpy(buffer, blob.data, blob.size);
+
+    duckdb_destroy_result(&result);
+    duckdb_disconnect(&conn);
+
+    *out_data = buffer;
+    *out_size = blob.size;
+    return true;
+}
+
+static void duckdb_read_stat_bind_data_free(void *ptr)
+{
+    duckdb_read_stat_bind_data *data = (duckdb_read_stat_bind_data *)ptr;
+    if (!data)
+    {
+        return;
+    }
+    if (data->error_message)
+    {
+        duckdb_free(data->error_message);
+    }
+    if (data->buffer)
+    {
+        duckdb_free(data->buffer);
+    }
+    if (data->path)
+    {
+        duckdb_free((void *)data->path);
+    }
+    if (data->format)
+    {
+        duckdb_free((void *)data->format);
+    }
+    if (data->encoding)
+    {
+        duckdb_free((void *)data->encoding);
+    }
+    duckdb_free(data);
+}
+
+static void duckdb_read_stat_apply_buffer_io(readstat_parser_t *parser, duckdb_read_stat_bind_data *data,
+                                             duckdb_read_stat_buffer_ctx *io_ctx)
+{
+    if (!data->buffer || data->buffer_size == 0)
+    {
+        return;
+    }
+
+    io_ctx->data = data->buffer;
+    io_ctx->size = data->buffer_size;
+    io_ctx->pos = 0;
+
+    readstat_set_open_handler(parser, &duckdb_read_stat_buffer_open);
+    readstat_set_close_handler(parser, &duckdb_read_stat_buffer_close);
+    readstat_set_seek_handler(parser, &duckdb_read_stat_buffer_seek);
+    readstat_set_read_handler(parser, &duckdb_read_stat_buffer_read);
+    readstat_set_update_handler(parser, &duckdb_read_stat_buffer_update);
+    readstat_set_io_ctx(parser, io_ctx);
+}
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix)
 {
@@ -112,6 +373,10 @@ int duckdb_read_stat_bind_handle_variable(int index, readstat_variable_t *variab
 void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx)
 {
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
+    if (context->error_message != NULL)
+    {
+        duckdb_free(context->error_message);
+    }
     context->error_message = (char *)duckdb_malloc(strlen(error_message) + 1);
     strcpy(context->error_message, error_message);
 }
@@ -122,7 +387,7 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
     duckdb_value path_value = duckdb_bind_get_parameter(info, 0);
     duckdb_value format_value = duckdb_bind_get_named_parameter(info, "format");
     duckdb_value encoding_value = duckdb_bind_get_named_parameter(info, "encoding");
-    const char *path = duckdb_get_varchar(path_value);
+    char *path = duckdb_get_varchar(path_value);
     duckdb_read_stat_bind_data *data = duckdb_malloc(sizeof(duckdb_read_stat_bind_data));
     readstat_error_t error;
 
@@ -130,6 +395,10 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
     data->path = path;
     data->format = NULL;
     data->encoding = NULL;
+    data->buffer = NULL;
+    data->buffer_size = 0;
+    data->error_message = NULL;
+    data->cardinality = 0;
 
     readstat_set_metadata_handler(parser, &duckdb_read_stat_bind_handle_metadata);
     readstat_set_variable_handler(parser, &duckdb_read_stat_bind_handle_variable);
@@ -138,14 +407,28 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
     if (encoding_value != NULL)
     {
-        const char *encoding = duckdb_get_varchar(encoding_value);
+        char *encoding = duckdb_get_varchar(encoding_value);
         data->encoding = encoding;
         readstat_set_file_character_encoding(parser, encoding);
     }
 
+    if (!duckdb_read_stat_load_buffer(data->path, &data->buffer, &data->buffer_size, &data->error_message))
+    {
+        if (data->error_message != NULL)
+        {
+            duckdb_bind_set_error(info, data->error_message);
+            readstat_parser_free(parser);
+            duckdb_read_stat_bind_data_free(data);
+            return;
+        }
+    }
+
+    duckdb_read_stat_buffer_ctx io_ctx;
+    duckdb_read_stat_apply_buffer_io(parser, data, &io_ctx);
+
     if (format_value != NULL)
     {
-        const char *format = duckdb_get_varchar(format_value);
+        char *format = duckdb_get_varchar(format_value);
         data->format = format;
 
         if (!strcmp(format, "sas7bdat"))
@@ -204,11 +487,12 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
     {
         duckdb_bind_set_error(info, data->error_message);
         readstat_parser_free(parser);
+        duckdb_read_stat_bind_data_free(data);
         return;
     }
 
     duckdb_bind_set_cardinality(data->bind_info, data->cardinality, true);
-    duckdb_bind_set_bind_data(info, data, duckdb_free);
+    duckdb_bind_set_bind_data(info, data, duckdb_read_stat_bind_data_free);
     readstat_parser_free(parser);
 }
 
@@ -504,6 +788,9 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
         readstat_set_file_character_encoding(parser, bind_data->encoding);
     }
 
+    duckdb_read_stat_buffer_ctx io_ctx;
+    duckdb_read_stat_apply_buffer_io(parser, bind_data, &io_ctx);
+
     if (bind_data->format != NULL)
     {
         if (!strcasecmp(bind_data->format, "sas7bdat"))
@@ -599,6 +886,7 @@ void duckdb_read_stat_replacement_scan(duckdb_replacement_scan_info info, const 
 
 DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info info, struct duckdb_extension_access *access)
 {
+    g_read_stat_db = access->get_database(info);
     duckdb_read_stat_register_read_stat_function(connection);
     duckdb_add_replacement_scan(*(access->get_database(info)), &duckdb_read_stat_replacement_scan, NULL, NULL);
     return true;

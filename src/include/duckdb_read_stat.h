@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "readstat.h"
 
 typedef enum duckdb_read_stat_file_format
@@ -23,6 +25,8 @@ typedef struct duckdb_read_stat_bind_data
     const char *encoding;
     idx_t cardinality;
     const char *path;
+    uint8_t *buffer;
+    idx_t buffer_size;
     char *error_message;
     duckdb_bind_info bind_info;
 } duckdb_read_stat_bind_data;
